@@ -157,7 +157,13 @@ from .utils import (
     PySendResult,
     unpack_iterable,
 )
-from .variables.base import SourceLocation, typestr, ValueMutationNew, VariableTracker
+from .variables.base import (
+    AttrMutationKind,
+    SourceLocation,
+    typestr,
+    ValueMutationNew,
+    VariableTracker,
+)
 from .variables.builder import FrameStateSizeEntry, VariableBuilder, wrap_fx_proxy
 from .variables.builtin import BuiltinVariable, DictBuiltinVariable
 from .variables.constant import ConstantVariable
@@ -2412,6 +2418,30 @@ class InstructionTranslatorBase(
             )
         self.output.side_effects.store_global(variable, name, value)
 
+    def DELETE_GLOBAL(self, inst: Instruction) -> None:
+        name = inst.argval
+        source = GlobalSource(name)
+        side_effects = self.output.side_effects
+        # Unlike DELETE_FAST/DELETE_ATTR/DELETE_SUBSCR this does not call
+        # _maybe_emit_sync_dealloc: the deleted value is never materialised as a
+        # variable here, and building one only to pass it would install guards on
+        # a name that is about to disappear. DELETE_DEREF omits it for the same
+        # reason.
+        if name not in self.symbolic_globals:
+            if name not in self.f_globals:
+                # Not in the real globals, and no earlier STORE_GLOBAL in this
+                # trace bound it.
+                self.raise_name_error(name)
+            self.symbolic_globals[name] = object()  # type: ignore[assignment]  # sentinel object
+        variable = side_effects.track_global_existing(
+            source, self.symbolic_globals[name]
+        )
+        pending = side_effects.store_attr_mutations.get(variable, {}).get(name)
+        if isinstance(pending, variables.DeletedVariable):
+            # An earlier `del` in this trace already removed the name.
+            self.raise_name_error(name)
+        side_effects.store_global(variable, name, variables.DeletedVariable())
+
     # Cache note: This cache only exists for the duration of this
     # InstructionTranslator - so it should be safe to do.
     @cache_method
@@ -2549,6 +2579,17 @@ class InstructionTranslatorBase(
         self.DUP_TOP(inst)
         self._load_attr(inst.argval)
 
+    def raise_name_error(self, name: str) -> NoReturn:
+        # Raised while tracing rather than recorded and replayed as a side
+        # effect, so that statement ordering and any enclosing handler match
+        # eager.
+        raise_observed_exception(
+            NameError,
+            self,
+            args=[f"name '{name}' is not defined"],
+            kwargs={"name": ConstantVariable.create(name)},
+        )
+
     # Cache note: This cache only exists for the duration of this
     # InstructionTranslator - so it should be safe to do.
     @cache_method
@@ -2556,12 +2597,7 @@ class InstructionTranslatorBase(
         if argval not in self.f_builtins:
             # Name is neither a global nor a builtin: matches CPython raising
             # NameError with `name` set to the missing identifier.
-            raise_observed_exception(
-                NameError,
-                self,
-                args=[f"name '{argval}' is not defined"],
-                kwargs={"name": ConstantVariable.create(argval)},
-            )
+            self.raise_name_error(argval)
         val = self.f_builtins[argval]
 
         if callable(val):
@@ -6522,6 +6558,48 @@ class InliningInstructionTranslator(InstructionTranslatorBase):
                     hints=[*graph_break_hints.SUPPORTABLE],
                 )
             self.output.side_effects.store_attr(fglobals_vt, name, value)
+
+    def DELETE_GLOBAL(self, inst: Instruction) -> None:
+        if self.output.global_scope is self.f_globals:
+            super().DELETE_GLOBAL(inst)
+            return
+        name = inst.argval
+        side_effects = self.output.side_effects
+        _, fglobals_vt, global_source = self.get_globals_source_and_value(name)
+        if isinstance(global_source, DictGetItemSource):
+            unimplemented(
+                gb_type="DELETE_GLOBAL in non-module globals",
+                context=name,
+                explanation=(
+                    "Dynamo cannot safely replay global deletes for an inlined "
+                    "function whose globals dict is not the registered module "
+                    "__dict__."
+                ),
+                hints=[*graph_break_hints.SUPPORTABLE],
+            )
+        if name not in self.f_globals:
+            if side_effects.has_pending_mutation_of_attr(fglobals_vt, name):
+                value = side_effects.store_attr_mutations[fglobals_vt][name]
+                if not isinstance(value, variables.DeletedVariable):
+                    # STORE_GLOBAL created this name only during tracing, so the
+                    # delete cancels the pending store and there is nothing to
+                    # replay against the real module dict.
+                    side_effects.discard_attr_mutation(fglobals_vt, name)
+                    return
+            # Nothing in this trace bound the name either.
+            self.raise_name_error(name)
+        elif isinstance(
+            side_effects.store_attr_mutations.get(fglobals_vt, {}).get(name),
+            variables.DeletedVariable,
+        ):
+            # An earlier `del` in this trace already removed the name.
+            self.raise_name_error(name)
+        side_effects.store_attr(
+            fglobals_vt,
+            name,
+            variables.DeletedVariable(),
+            mutation_kind=AttrMutationKind.GLOBAL_DELETE,
+        )
 
 
 class InliningGeneratorInstructionTranslator(InliningInstructionTranslator):

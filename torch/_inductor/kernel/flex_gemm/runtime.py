@@ -17,6 +17,7 @@ from torch._inductor.kernel.flex_gemm.constraints import (
 )
 from torch._inductor.kernel.flex_gemm.output_layout import FlexGemmOutputStorageLayout
 from torch._inductor.runtime.cache_dir_utils import cache_dir
+from torch._inductor.utils import ceildiv
 from torch._prims_common import is_expandable_to
 
 
@@ -32,8 +33,15 @@ def inductor_quack_cache_dir() -> str:
     return os.path.join(cache_dir(), "quack")
 
 
-def flex_gemm_problem(device: torch.device, m: int, n: int, concat_layout: Any) -> Any:
-    """Describe a dense FlexGEMM call (physical GEMM M and N) for QuACK config pruning."""
+def flex_gemm_problem(
+    device: torch.device,
+    m: int,
+    n: int,
+    concat_layout: Any,
+    *,
+    blockscaled: bool = False,
+) -> Any:
+    """Describe a FlexGEMM call (physical GEMM M and N) for QuACK config pruning."""
     from torch._vendor.quack.gemm_runtime.autotune import mod_b_kn, ModProblem
 
     return ModProblem(
@@ -41,8 +49,25 @@ def flex_gemm_problem(device: torch.device, m: int, n: int, concat_layout: Any) 
         m=m,
         n=n,
         b_kn=mod_b_kn(device, concat_layout),
+        blockscaled=blockscaled,
         concat=bool(concat_layout),
     )
+
+
+def flex_gemm_preferred_config(problem: Any) -> Any:
+    """QuACK's untuned default for ``problem``; leads the legal list when legal."""
+    from torch._vendor.quack.cute_dsl_utils import get_device_capacity
+    from torch._vendor.quack.gemm_config import (
+        blockscaled_default_config,
+        default_config,
+    )
+
+    if problem.blockscaled:
+        capacity = get_device_capacity(problem.device)[0]
+        return blockscaled_default_config(
+            problem.m, problem.n, device_capacity=capacity
+        )
+    return default_config(problem.device)
 
 
 def check_flex_gemm_config(epimod: Any, quack_config: Any, problem: Any) -> None:
@@ -82,6 +107,17 @@ def quack_epilogue_arg(arg: torch.Tensor) -> torch.Tensor:
 def selection_callback(acc, *operands):
     """Stand in for generated callbacks in config-selection EpiMods."""
     raise AssertionError("config-selection EpiMods are never launched")
+
+
+def quack_blockscaled_scale_view(
+    scale: torch.Tensor, mn: int, storage_k: int, format_name: str
+) -> torch.Tensor:
+    """View a public flat SWIZZLE_32_4_4 scale as QuACK's (rm, rk, 32, 4, 4) blocked tensor."""
+    from torch._vendor.quack.blockscaled import operand as blockscaled
+
+    format = blockscaled.BlockScaledFormat.from_name(format_name)
+    sf_k = ceildiv(format.logical_k(storage_k), format.sf_vec_size)
+    return scale.view(ceildiv(mn, 128), ceildiv(sf_k, 4), 32, 4, 4)
 
 
 def normalize_c(
@@ -327,6 +363,9 @@ def gemm_epilogue(
     C: torch.Tensor | None = None,
     alpha: float = 1.0,
     beta: float = 0.0,
+    SFA: torch.Tensor | None = None,
+    SFB: torch.Tensor | None = None,
+    blockscaled_format: str | None = None,
     out: torch.Tensor,
     aux_outs: tuple[torch.Tensor, ...] = (),
     epilogue_args: tuple[torch.Tensor, ...] = (),
@@ -336,12 +375,21 @@ def gemm_epilogue(
     config: tuple[tuple[str, Any], ...],
     stream: int | None = None,
 ) -> torch.Tensor:
-    """Run a dense FlexGEMM call through the vendored QuACK EpiMod.
+    """Run a dense or block-scaled FlexGEMM call through the vendored QuACK EpiMod.
 
     ``config`` pins the exact GemmConfig Inductor selected at lowering time.
     """
     from torch._vendor.quack.gemm_config import GemmConfig
 
+    if blockscaled_format is not None:
+        if SFA is None or SFB is None:
+            raise RuntimeError("FlexGEMM block-scaled GEMMs require SFA and SFB")
+        SFA = quack_blockscaled_scale_view(
+            SFA, a.shape[0], a.shape[1], blockscaled_format
+        )
+        SFB = quack_blockscaled_scale_view(
+            SFB, b.shape[1], b.shape[0], blockscaled_format
+        )
     if (
         output_contraction is not None
         and output_contraction.chunked
@@ -426,7 +474,13 @@ def gemm_epilogue(
     check_flex_gemm_config(
         epimod,
         quack_config,
-        flex_gemm_problem(a.device, a.shape[-2], b.shape[-1], concat_layout),
+        flex_gemm_problem(
+            a.device,
+            a.shape[-2],
+            b.shape[-1],
+            concat_layout,
+            blockscaled=SFA is not None,
+        ),
     )
     stream_context = (
         torch.cuda.stream(torch.cuda.ExternalStream(stream, device=a.device))
@@ -437,6 +491,16 @@ def gemm_epilogue(
         # Layout callbacks predicate logical stores but do not own padded bytes.
         if initialize_local_reduce_out is not None:
             initialize_local_reduce_out.zero_()
+        blockscaled_kwargs = (
+            {}
+            if blockscaled_format is None
+            else {
+                "SFA": SFA,
+                "SFB": SFB,
+                "bs_format_a": blockscaled_format,
+                "bs_format_b": blockscaled_format,
+            }
+        )
         result = epimod(
             a,
             b,
@@ -448,6 +512,7 @@ def gemm_epilogue(
             tuned=False,
             concat_layout=concat_layout,
             compile_dispatch=False,
+            **blockscaled_kwargs,
             **operands,
         )
     return result[main_name]

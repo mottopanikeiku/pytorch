@@ -337,27 +337,18 @@ def format_flex_gemm_lowering_plan(
     return "\n".join(lines)
 
 
-def format_flex_gemm_selection(choice: "ir.ChoiceCaller | None", *, tuned: bool) -> str:
-    """Render the search summary and selected FlexGEMM template."""
+def format_flex_gemm_config_candidates(configs: Any, *, tuned: bool) -> str:
+    """Render the QuACK configs Inductor will benchmark or pin."""
     lines = [
-        "search:",
-        f"  mode: {'autotuned' if tuned else 'fixed'}",
-        "  native config selection: QuACK-owned",
-        "",
-        "selected:",
+        f"mode: {'autotune' if tuned else 'default'}",
+        f"candidates: {len(configs)}",
     ]
-    if choice is None:
-        lines.append("  deferred to a multi-template buffer")
-    else:
-        lines.append(f"  template: {choice.name}")
-    lines.extend(
-        (
-            "",
-            "more_detail_commands:",
-            '  analysis/codegen: TORCH_LOGS="+flex_gemm"',
-            '  autotune timings: TORCH_LOGS="flex_gemm,autotuning"',
-            '  generated kernel: TORCH_LOGS="flex_gemm,kernel_code"',
-            '  final wrapper: TORCH_LOGS="flex_gemm,output_code"',
+    for config in configs:
+        fields = dict(config)
+        lines.append(
+            "  tile=({tile_m}, {tile_n}) cluster=({cluster_m}, {cluster_n}) "
+            "swap_ab={swap_ab} dynamic_persistent={is_dynamic_persistent}".format(
+                **fields
+            )
         )
-    )
     return "\n".join(lines)

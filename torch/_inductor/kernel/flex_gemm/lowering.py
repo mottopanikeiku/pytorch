@@ -8,9 +8,12 @@ is stale and will fix up later on. See ``lower_quack_flex_gemm`` for the flow.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import logging
 from typing import Any, TYPE_CHECKING
+
+import sympy
 
 import torch
 import torch.utils._pytree as pytree
@@ -24,23 +27,30 @@ from torch._logging import warning_once
 from torch.utils._ordered_set import OrderedSet
 
 from ... import ir
+from ...heuristics.template.flex_gemm import flex_gemm_search_space
 from ...ir import IRNode, TensorBox
 from ...lowering import empty_strided, process_subgraph_nodes, register_lowering
 from ...utils import _IntLike, ceildiv, is_bf16x9_matmul
 from ..gemm_epilogue_utils import statically_known_shape_equal
-from .constraints import aux_output_shape_error, LOCAL_REDUCE_DENSE_MM_SCOPE_ERROR
+from .constraints import (
+    aux_output_shape_error,
+    FlexGemmOutputContraction,
+    LOCAL_REDUCE_DENSE_MM_SCOPE_ERROR,
+)
 from .debug import (
     format_flex_gemm_analysis,
     format_flex_gemm_analysis_details,
+    format_flex_gemm_config_candidates,
     format_flex_gemm_lowering_plan,
     format_flex_gemm_problem,
-    format_flex_gemm_selection,
     log_flex_gemm_artifact,
 )
 
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from .template import FlexGemmEpilogueConfig
 
 
 log = logging.getLogger(__name__)
@@ -199,6 +209,78 @@ def flex_gemm_local_reduce_metas(local_reduce) -> tuple[Any, ...]:
     return (local_reduce.store.node.meta["val"],)
 
 
+def flex_gemm_quack_configs(
+    template_config: FlexGemmEpilogueConfig,
+    gemm_input_nodes: list[IRNode],
+    epilogue_input_nodes: list[IRNode],
+) -> tuple[tuple[tuple[str, Any], ...], ...]:
+    """Ask QuACK which GemmConfigs this call may pin, default first.
+
+    Legality is decided by the EpiOps, so the runtime's EpiMod is built here
+    from metadata with a stub epilogue and pruned against the GEMM shape hints;
+    ``guard_flex_gemm_config_shapes`` guards the shape-dependent rules.
+    """
+    from torch._inductor.kernel.flex_gemm.runtime import (
+        flex_gemm_epimod,
+        flex_gemm_problem,
+        quack_epilogue_dtype,
+        selection_callback,
+    )
+    from torch._inductor.virtualized import V
+    from torch._vendor.quack.gemm_config import default_config
+    from torch._vendor.quack.gemm_runtime.autotune import legal_mod_configs
+
+    output_contraction = template_config.output_contraction
+    local_reduce = template_config.local_reduce
+    epimod = flex_gemm_epimod(
+        selection_callback,
+        tuple(quack_epilogue_dtype(node.get_dtype()) for node in epilogue_input_nodes),
+        template_config.epilogue_arg_kinds,
+        len(template_config.aux_out_indices),
+        None if local_reduce is None else local_reduce.selection_plan(),
+        output_contraction,
+    )
+    sizevars = V.graph.sizevars
+    mat1 = gemm_input_nodes[template_config.gemm_op.mat1_index]
+    mat2 = gemm_input_nodes[template_config.gemm_op.mat2_index]
+    device = mat1.get_device_or_error()
+    problem = flex_gemm_problem(
+        device,
+        sizevars.optimization_hint(mat1.get_size()[-2]),
+        sizevars.optimization_hint(mat2.get_size()[-1]),
+        None if output_contraction is None else output_contraction.concat_layout,
+    )
+    legal = legal_mod_configs(
+        epimod, device, problem, preferred_config=default_config(device)
+    )
+    return tuple(
+        tuple(sorted(dataclasses.asdict(quack_config).items()))
+        for quack_config in legal
+    )
+
+
+def guard_flex_gemm_config_shapes(
+    quack_configs: tuple[tuple[tuple[str, Any], ...], ...],
+    n: _IntLike,
+    output_contraction: FlexGemmOutputContraction | None,
+) -> None:
+    """Guard the problem-size rules QuACK applied to the pinned configs.
+
+    Selection pruned on concrete shape hints; these are the pruning
+    conditions that depend on physical N, so a dynamic graph recompiles instead
+    of launching a config QuACK would have rejected (``swap_ab`` needs
+    ``N % 8 == 0``; ``GroupedMainStore.supports_problem`` needs ``tile_n <= N``).
+    """
+    from torch._inductor.virtualized import V
+
+    sizevars = V.graph.sizevars
+    configs = [dict(quack_config) for quack_config in quack_configs]
+    if any(fields["swap_ab"] for fields in configs):
+        sizevars.check(sympy.Eq(sympy.Mod(n, 8), 0))
+    if output_contraction is not None:
+        sizevars.check_leq(max(fields["tile_n"] for fields in configs), n)
+
+
 def flex_gemm_autotune_view_input(node: ir.ReinterpretView) -> torch.Tensor:
     """Rebuild a logical view for Python-backed template benchmarks."""
     from torch._inductor.select_algorithm import (
@@ -235,7 +317,7 @@ def lower_quack_flex_gemm(gemm_op, subgraph, args, gemm_kwargs, kernel_options):
                          |        `--> derive layout + allocate aux
                          |
                          +--> grouped/reduction geometry
-                         |        `--> filter QuACK configurations
+                         |        `--> flex_gemm_candidate_configs()
                          |
                          `--> materialize_flex_gemm_epilogue()
                                   `--> CuTeDSL epilogue + callbacks
@@ -264,6 +346,19 @@ def lower_quack_flex_gemm(gemm_op, subgraph, args, gemm_kwargs, kernel_options):
         raise NotImplementedError("FlexGEMM fast_math kernel option must be bool")
     if "config" in kernel_options and not isinstance(explicit_config, dict):
         raise NotImplementedError("FlexGEMM config kernel option must be a dict")
+    config_constraints = {} if explicit_config is None else dict(explicit_config)
+    if config_constraints:
+        from torch._vendor.quack.gemm_config import GemmConfig
+
+        config_fields = OrderedSet(
+            field.name for field in dataclasses.fields(GemmConfig)
+        )
+        unknown_fields = OrderedSet(config_constraints) - config_fields
+        if unknown_fields:
+            raise NotImplementedError(
+                f"unknown GemmConfig constraint {sorted(unknown_fields)}; "
+                f"choose one of {', '.join(config_fields)}"
+            )
 
     from torch._inductor.kernel.flex_gemm.fx_cutedsl_codegen import (
         analyze_flex_gemm_epilogue,
@@ -488,39 +583,69 @@ def lower_quack_flex_gemm(gemm_op, subgraph, args, gemm_kwargs, kernel_options):
             len(gemm_input_nodes) + len(epilogue_input_nodes),
         )
     )
-    choices: list[Any] = []
-    error = flex_gemm_epilogue_template.maybe_append_choice(
-        choices,
+    template_config = FlexGemmEpilogueConfig(
+        epilogue_name=epimod_source.name,
+        epilogue_source=epimod_source.source,
+        gemm_op=op_spec,
+        alpha=float(alpha),
+        beta=float(beta),
+        quack_config=None,
+        epilogue_arg_indices=epilogue_arg_indices,
+        epilogue_arg_kinds=epilogue_arg_kinds,
+        aux_out_indices=aux_out_indices,
+        local_reduce=template_local_reduce,
+        output_contraction=output_contraction,
+    )
+    template_kwargs = dict(
         input_nodes=input_nodes,
         layout=layout,
         mutated_inputs=mutated_input_nodes or None,
-        config=FlexGemmEpilogueConfig(
-            epilogue_name=epimod_source.name,
-            epilogue_source=epimod_source.source,
-            gemm_op=op_spec,
-            alpha=float(alpha),
-            beta=float(beta),
-            quack_config_constraints=(
-                tuple(sorted(explicit_config.items()))
-                if explicit_config is not None
-                else ()
-            ),
-            epilogue_arg_indices=epilogue_arg_indices,
-            epilogue_arg_kinds=epilogue_arg_kinds,
-            aux_out_indices=aux_out_indices,
-            local_reduce=template_local_reduce,
-            output_contraction=output_contraction,
-            tuned=tuned,
-        ),
     )
-    if error is not None:
-        raise error
+    legal_configs = flex_gemm_quack_configs(
+        template_config, gemm_input_nodes, epilogue_input_nodes
+    )
+    if config_constraints:
+        legal_configs = tuple(
+            config
+            for config in legal_configs
+            if all(
+                dict(config)[name] == value
+                for name, value in config_constraints.items()
+            )
+        )
+        if not legal_configs:
+            raise NotImplementedError(
+                "no supported GemmConfig matches "
+                f"config_constraints={config_constraints!r} for this call"
+            )
+    quack_configs = (
+        flex_gemm_search_space(legal_configs) if tuned else legal_configs[:1]
+    )
+    guard_flex_gemm_config_shapes(
+        quack_configs,
+        gemm_input_nodes[op_spec.mat2_index].get_size()[-1],
+        output_contraction,
+    )
+    log_flex_gemm_artifact(
+        "config_candidates",
+        lambda: format_flex_gemm_config_candidates(quack_configs, tuned=tuned),
+        lowering_name=subgraph.name,
+    )
+    choices: list[Any] = []
+    for quack_config in quack_configs:
+        error = flex_gemm_epilogue_template.maybe_append_choice(
+            choices,
+            config=dataclasses.replace(template_config, quack_config=quack_config),
+            **template_kwargs,
+        )
+        if error is not None:
+            raise error
     input_gen_fns = {
         index: flex_gemm_autotune_view_input
         for index, input_node in enumerate(input_nodes)
         if isinstance(input_node, ir.ReinterpretView)
     }
-    result, selected_choice = autotune_select_algorithm(
+    result, _ = autotune_select_algorithm(
         "flex_gemm_epilogue",
         choices,
         input_nodes,
@@ -528,11 +653,9 @@ def lower_quack_flex_gemm(gemm_op, subgraph, args, gemm_kwargs, kernel_options):
         input_gen_fns=input_gen_fns or None,
         **({"return_multi_template": False} if mutated_input_nodes else {}),
     )
-    log_flex_gemm_artifact(
-        "selection",
-        lambda: format_flex_gemm_selection(selected_choice, tuned=tuned),
-        lowering_name=subgraph.name,
-    )
+    if len(choices) == 1:
+        # A single choice skips autotuning; compile its kernel now instead of at first call.
+        choices[0].precompile()
     structural_outs = {}
     if local_reduce_store is not None:
         structural_outs[local_reduce_store.node] = local_reduce_outs[0]

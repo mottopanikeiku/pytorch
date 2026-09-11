@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
 
 _PRECOMPILE_LOCK = threading.Lock()
+_BUILTIN_CALLBACKS = frozenset(OrderedSet(["add", "mul", "max", "min", "mean"]))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -61,6 +62,8 @@ class FlexGemmEpilogueLocalReduceConfig:
     binary_store_finalize: bool = False
     prepass_combine: str | None = None
     prepass_finalize: str | None = None
+    reduce_planes: int = 1
+    fragment_reduced: bool = False
 
     @classmethod
     def from_plan(
@@ -84,6 +87,8 @@ class FlexGemmEpilogueLocalReduceConfig:
             source.local_reduce_binary_store_finalize,
             source.local_reduce_prepass_combine,
             source.local_reduce_prepass_finalize,
+            source.local_reduce_planes,
+            source.local_reduce_fragment_reduced,
         )
 
     def selection_plan(self) -> "FlexGemmRuntimeLocalReducePlan":
@@ -94,15 +99,20 @@ class FlexGemmEpilogueLocalReduceConfig:
         )
 
         def callback(name: str | None) -> Any:
-            return name if name in (None, "mean") else selection_callback
+            return (
+                name
+                if name is None or name in _BUILTIN_CALLBACKS
+                else selection_callback
+            )
 
         return FlexGemmRuntimeLocalReducePlan(
             self.geometry,
             stores=self.out_index is not None,
             feeds_main=self.feeds_main,
-            combine=self.combine,
+            combine=callback(self.combine),
             finalize=callback(self.finalize),
             finalize_operands=self.finalize_operands,
+            reduce_planes=self.reduce_planes,
             store_finalize=callback(self.store_finalize),
             binary_store_finalize=self.binary_store_finalize,
             prepass=None if self.prepass_combine is None else selection_callback,
@@ -227,8 +237,8 @@ class FlexGemmEpilogueKernel(CuteDSLTemplateKernel):
 
     @staticmethod
     def _callback_reference(name: str) -> str:
-        """Render a built-in finalizer name or generated callable reference."""
-        return repr(name) if name == "mean" else name
+        """Render a built-in callback name or generated callable reference."""
+        return repr(name) if name in _BUILTIN_CALLBACKS else name
 
     def _local_reduce_geometry(
         self, local_reduce: FlexGemmEpilogueLocalReduceConfig
@@ -255,7 +265,13 @@ class FlexGemmEpilogueKernel(CuteDSLTemplateKernel):
             plan += f", output_layout={local_reduce.output_layout.codegen_reference()}"
         if local_reduce.feeds_main:
             plan += ", feeds_main=True"
-        plan += f", combine={local_reduce.combine!r}"
+        if local_reduce.combine is None:
+            raise RuntimeError("FlexGEMM EpiMod local reductions require a combine")
+        plan += f", combine={self._callback_reference(local_reduce.combine)}"
+        if local_reduce.reduce_planes != 1:
+            plan += f", reduce_planes={local_reduce.reduce_planes}"
+        if local_reduce.fragment_reduced:
+            plan += ", fragment_reduced=True"
         if local_reduce.finalize is not None:
             plan += f", finalize={self._callback_reference(local_reduce.finalize)}"
         if local_reduce.finalize_operands:

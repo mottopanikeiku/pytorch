@@ -13778,6 +13778,56 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         self.common(fn, [torch.rand(())])
 
+    @parametrize("dim", [1, 2, 3])
+    @parametrize("padding", [0, 1])
+    @parametrize("ceil_mode", [False, True])
+    @parametrize("count_include_pad", [False, True])
+    def test_avg_pool_ceil_mode_backward(
+        self, dim, padding, ceil_mode, count_include_pad
+    ):
+        pool = getattr(torch.nn.functional, f"avg_pool{dim}d")
+
+        def fn(x):
+            return pool(
+                x,
+                3,
+                stride=2,
+                padding=padding,
+                ceil_mode=ceil_mode,
+                count_include_pad=count_include_pad,
+            )
+
+        self.common(
+            fn,
+            (torch.randn([1, 2] + [6] * dim, requires_grad=True),),
+            check_gradient=True,
+        )
+
+    @parametrize("dim", [2, 3])
+    @parametrize("padding", [0, 1])
+    @parametrize("count_include_pad", [False, True])
+    def test_avg_pool_ceil_mode_backward_divisor_override(
+        self, dim, padding, count_include_pad
+    ):
+        pool = getattr(torch.nn.functional, f"avg_pool{dim}d")
+
+        def fn(x):
+            return pool(
+                x,
+                3,
+                stride=2,
+                padding=padding,
+                ceil_mode=True,
+                count_include_pad=count_include_pad,
+                divisor_override=5,
+            )
+
+        self.common(
+            fn,
+            (torch.randn([1, 2] + [6] * dim, requires_grad=True),),
+            check_gradient=True,
+        )
+
     def test_avg_pool2d_backward(self):
         def fn(a, b):
             return aten.avg_pool2d_backward(

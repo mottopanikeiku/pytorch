@@ -490,7 +490,7 @@ def _kl_pareto_pareto(p, q):
 
 @register_kl(Poisson, Poisson)
 def _kl_poisson_poisson(p, q):
-    return p.rate * (p.rate.log() - q.rate.log()) - (p.rate - q.rate)
+    return p.rate.xlogy(p.rate) - p.rate.xlogy(q.rate) - (p.rate - q.rate)
 
 
 @register_kl(TransformedDistribution, TransformedDistribution)

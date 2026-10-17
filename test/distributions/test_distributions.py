@@ -6228,6 +6228,28 @@ class TestKL(DistributionsTestCase):
         )
         self.assertEqual(kl_divergence(Uniform(0, 1), Beta(1, 1)), 0)
 
+    def test_kl_poisson_zero_rate(self):
+        for p_rate, q_rate, expected in [
+            (0.0, 0.0, 0.0),
+            (0.0, 2.0, 2.0),
+            (2.0, 0.0, inf),
+        ]:
+            with self.subTest(p_rate=p_rate, q_rate=q_rate):
+                self.assertEqual(
+                    kl_divergence(Poisson(p_rate), Poisson(q_rate)), expected
+                )
+
+    def test_kl_poisson_zero_rate_broadcast(self):
+        for dtype in [torch.float32, torch.float64]:
+            with self.subTest(dtype=dtype):
+                p = Poisson(torch.tensor([[0.0], [1.0]], dtype=dtype))
+                q = Poisson(torch.tensor([0.0, 1.0, 2.0], dtype=dtype))
+                expected = torch.tensor(
+                    [[0.0, 1.0, 2.0], [inf, 0.0, 1.0 - math.log(2.0)]],
+                    dtype=dtype,
+                )
+                self.assertEqual(kl_divergence(p, q), expected)
+
     def test_kl_shape(self):
         for Dist, params in _get_examples():
             for i, param in enumerate(params):

@@ -28,7 +28,8 @@ class Poisson(ExponentialFamily):
         tensor([ 3.])
 
     Args:
-        rate (Number, Tensor): the rate parameter
+        rate (Number, Tensor): the nonnegative rate parameter. A zero rate
+            gives probability one to a count of zero.
     """
 
     # pyrefly: ignore [bad-override]

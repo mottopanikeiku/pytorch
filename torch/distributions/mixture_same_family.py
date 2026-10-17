@@ -48,7 +48,8 @@ class MixtureSameFamily(Distribution):
             The number of categories must match the rightmost batch
             dimension of the `component_distribution`. Must have either
             scalar `batch_shape` or `batch_shape` matching
-            `component_distribution.batch_shape[:-1]`
+            `component_distribution.batch_shape[:-1]`. A scalar mixture is
+            broadcast across the component distribution's batch dimensions.
         component_distribution: `torch.distributions.Distribution`-like
             instance. Right-most batch dimension indexes component.
     """
@@ -183,7 +184,9 @@ class MixtureSameFamily(Distribution):
             es = self.event_shape
 
             # mixture samples [n, B]
-            mix_sample = self.mixture_distribution.sample(sample_shape)
+            mix_sample = self.mixture_distribution.expand(self.batch_shape).sample(
+                sample_shape
+            )
             mix_shape = mix_sample.shape
 
             # component samples [n, B, k, E]

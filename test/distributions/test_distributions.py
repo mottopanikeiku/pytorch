@@ -2717,6 +2717,22 @@ class TestDistributions(DistributionsTestCase):
             normal_case_2d_multi_batch.sample((2, 7)).size(), (2, 7, 4, 3, 2)
         )
 
+    @parametrize("batch_shape", [(3,), (2, 3)])
+    @parametrize("event_shape", [(), (2,)])
+    @parametrize("sample_shape", [(), (4,), (2, 3)])
+    def test_mixture_same_family_scalar_mixture(
+        self, batch_shape, event_shape, sample_shape
+    ):
+        shape = batch_shape + (2,) + event_shape
+        components = Independent(
+            Normal(torch.zeros(shape), torch.ones(shape)), len(event_shape)
+        )
+        mixture = Categorical(torch.tensor([0.25, 0.75]))
+        dist = MixtureSameFamily(mixture, components)
+        self.assertEqual(
+            dist.sample(sample_shape).shape, sample_shape + batch_shape + event_shape
+        )
+
     @unittest.skipIf(not TEST_NUMPY, "Numpy not found")
     def test_mixture_same_family_normal_log_prob(self):
         probs = torch.rand(10, 5).softmax(dim=-1)

@@ -159,7 +159,8 @@ class GrouperIterDataPipe(IterDataPipe[DataChunk]):
         datapipe: Iterable datapipe to be grouped
         group_key_fn: Function used to generate group key from the data of the source datapipe
         keep_key: Option to yield the matching key along with the items in a tuple,
-            resulting in `(key, [items])` otherwise returning [items]
+            resulting in `(key, [items])` otherwise returning [items]. This also applies
+            to groups yielded when the buffer is full.
         buffer_size: The size of buffer for ungrouped data
         group_size: The max size of each group, a batch is yielded as soon as it reaches this size
         guaranteed_group_size: The guaranteed minimum group size to be yielded in case the buffer is full
@@ -256,7 +257,7 @@ class GrouperIterDataPipe(IterDataPipe[DataChunk]):
         self.curr_buffer_size -= biggest_size
         del self.buffer_elements[biggest_key]
 
-        return result_to_yield
+        return biggest_key, result_to_yield
 
     def __iter__(self):
         for x in self.datapipe:
@@ -274,7 +275,7 @@ class GrouperIterDataPipe(IterDataPipe[DataChunk]):
                 del self.buffer_elements[key]
 
             if self.curr_buffer_size == self.max_buffer_size:
-                result_to_yield = self._remove_biggest_key()
+                key, result_to_yield = self._remove_biggest_key()
                 if result_to_yield is not None:
                     result = self.wrapper_class(result_to_yield)
                     yield (key, result) if self.keep_key else result

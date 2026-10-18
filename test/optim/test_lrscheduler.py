@@ -1718,6 +1718,27 @@ class TestLRScheduler(TestCase):
         self.assertIs(scheduler._scale_fn_custom, scale_fn)
         self.assertIs(restored_scheduler._scale_fn_custom, scale_fn)
 
+    @parametrize("scale_fn", [None, lambda _: 0.5, LambdaLRTestObject(0.5)])
+    def test_cycle_lr_load_state_dict_preserves_input(self, scale_fn):
+        scheduler = CyclicLR(
+            self.opt, base_lr=0.1, max_lr=0.5, step_size_up=2, scale_fn=scale_fn
+        )
+        self.opt.step()
+        scheduler.step()
+        state = scheduler.state_dict()
+        expected_state = copy.deepcopy(state)
+
+        scheduler.load_state_dict(state)
+        self.assertEqual(state, expected_state)
+        scheduler.load_state_dict(state)
+        self.assertEqual(scheduler.state_dict(), expected_state)
+        self.assertIs(scheduler._scale_fn_custom, scale_fn)
+
+        self.opt.step()
+        scheduler.step()
+        expected_lr = 0.5 if scale_fn is None else 0.3
+        self.assertEqual(scheduler.get_last_lr(), [expected_lr, expected_lr])
+
     def test_onecycle_lr_invalid_anneal_strategy(self):
         with self.assertRaises(ValueError):
             scheduler = OneCycleLR(

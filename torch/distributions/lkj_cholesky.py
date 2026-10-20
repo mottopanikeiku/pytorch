@@ -85,7 +85,7 @@ class LKJCholesky(Distribution):
             device=self.concentration.device,
         )
         offset = torch.cat([offset.new_zeros((1,)), offset])
-        beta_conc1 = offset + 0.5
+        beta_conc1 = 0.5 * offset + 0.5
         beta_conc0 = marginal_conc.unsqueeze(-1) - 0.5 * offset
         self._beta = Beta(beta_conc1, beta_conc0)
         super().__init__(batch_shape, event_shape, validate_args)

@@ -4253,6 +4253,27 @@ class TestDistributions(DistributionsTestCase):
             invalid_sample = torch.cat([sample, sample.new_ones(1, dim)], dim=0)
             self.assertRaises(ValueError, lambda: lkj.log_prob(invalid_sample))
 
+    @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
+    @set_default_dtype_if_supported(torch.double)
+    def test_lkj_cholesky_sample(self):
+        set_rng_seed(0)  # see Note [Randomized statistical tests]
+        num_samples = 10000
+        for dim, concentration in product([3, 4], [0.5, 1.0, 2.0]):
+            L = LKJCholesky(dim, concentration).sample((num_samples,))
+            corr = (L @ L.mT).cpu()
+            # every off-diagonal correlation r satisfies (r + 1) / 2 ~ Beta(b, b)
+            b = concentration - 1 + dim / 2
+            for i, j in zip(*torch.tril_indices(dim, dim, -1, device="cpu").tolist()):
+                p_value = scipy.stats.kstest(
+                    (corr[:, i, j].numpy() + 1) / 2, scipy.stats.beta(b, b).cdf
+                ).pvalue
+                self.assertGreater(
+                    p_value,
+                    1e-3,
+                    f"LKJCholesky(dim={dim}, concentration={concentration}).sample() "
+                    f"has a biased marginal for correlation ({i}, {j})",
+                )
+
     @expectedFailureMPS
     def test_independent_shape(self):
         for Dist, params in _get_examples():

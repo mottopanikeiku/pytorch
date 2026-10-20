@@ -1755,6 +1755,18 @@ tensor(..., device='meta', size=(1,), requires_grad=True)""")
         sample = next(model.parameters())[0, 0, 0]
         self.assertTrue(torch.equal(sample.data, vec.data[:5]))
 
+    def test_parameters_to_vector_non_contiguous(self):
+        model = nn.Sequential(nn.Conv2d(3, 10, 5), nn.Linear(10, 20))
+        expected = parameters_to_vector(model.parameters())
+
+        model = model.to(memory_format=torch.channels_last)
+        self.assertFalse(model[0].weight.is_contiguous())
+        vec = parameters_to_vector(model.parameters())
+        self.assertEqual(vec, expected)
+
+        vector_to_parameters(vec * 2, model.parameters())
+        self.assertEqual(parameters_to_vector(model.parameters()), expected * 2)
+
     def test_rnn_weight_norm(self):
         def check_weight_norm(l, name, num_params):
             # This Module has 4 or 5 parameters called:

@@ -21,7 +21,7 @@ def parameters_to_vector(parameters: Iterable[torch.Tensor]) -> torch.Tensor:
         # Ensure the parameters are located in the same device
         param_device = _check_param_device(param, param_device)
 
-        vec.append(param.view(-1))
+        vec.append(param.reshape(-1))
     return torch.cat(vec)
 
 

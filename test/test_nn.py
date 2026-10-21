@@ -14789,6 +14789,32 @@ class TestNNDeviceType(NNTestCase):
         ref = (torch.logsumexp(z, 1) - (p.cpu().double() * z).sum(1)).mean()
         self.assertEqual(loss.cpu().double(), ref, rtol=5e-3, atol=0.5)
 
+    @parametrize_test("acc_policy", ["auto", "compact", "accurate"])
+    @parametrize_test("prob_target", [False, True])
+    def test_linear_cross_entropy_bf16_loss_many_chunks(self, device, acc_policy, prob_target):
+        # Regression: with bf16 input and an fp32 acc_dtype the scalar loss was
+        # still accumulated in bf16, rounding the running sum once or twice per
+        # chunk, so over many chunks the mean drifted by many bf16 ulps (6.0
+        # against 6.64 here). Accumulated in acc_dtype it stays within one.
+        if "cuda" in device and not SM80OrLater:
+            self.skipTest("bf16 requires SM80+ on CUDA")
+        torch.manual_seed(0)
+        dtype = torch.bfloat16
+        N, D, V = 512, 4, 512
+        x = torch.randn(N, D, device=device, dtype=dtype) / 2
+        w = torch.randn(V, D, device=device, dtype=dtype)
+        if prob_target:
+            t = torch.rand(N, V, device=device, dtype=torch.float32)
+            t = (t / t.sum(1, keepdim=True)).to(dtype)
+        else:
+            t = torch.randint(0, V, (N,), device=device)
+        options = nn.LinearCrossEntropyOptions(
+            acc_policy=acc_policy, acc_dtype=torch.float32, batch_chunk_size=2)
+        loss = nn.functional.linear_cross_entropy(x, w, t, options=options)
+        z = x.cpu().double() @ w.cpu().double().t()
+        ref = nn.functional.cross_entropy(z, t.cpu().double() if prob_target else t.cpu())
+        self.assertEqual(loss.cpu().double(), ref, atol=0, rtol=torch.finfo(dtype).eps)
+
     def test_linear_cross_entropy_prob_target_dispatch(self, device):
         """Probability-target dispatch edges. The harness covers the
         supported configurations; this covers the gate itself: supported

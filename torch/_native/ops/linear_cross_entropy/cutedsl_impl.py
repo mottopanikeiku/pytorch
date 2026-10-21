@@ -159,9 +159,8 @@ def _batch_chunked_kernel(
 
     The logits buffer dtype is eager's (fp16 for fp16 input, `acc_dtype`
     otherwise), while `exp()` and the scaled gradient stay in fp32 registers.
-    The scalar loss accumulates in `acc_dtype`, where eager rounds it to bf16
-    twice per chunk, so for bf16 the two agree to a few ULP of that dtype, not
-    bit for bit.
+    The scalar loss accumulates in `acc_dtype`, like eager's, but its terms are
+    summed in a different order, so the two need not agree bit for bit.
     """
     from torch.nn.modules.linear_cross_entropy import (
         _check_acc_dtype_compatible,

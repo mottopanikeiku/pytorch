@@ -203,8 +203,9 @@ def _batch_chunked_kernel(
     # `.contiguous()` because the kernel is compiled for a stride-1 target and
     # `_corrected_target` may return the caller's tensor.
     target_hat = _corrected_target(target, ignore_index, num_classes).contiguous()
+    mask = target == ignore_index
     row_scale = _neg_weight_target(
-        target_hat, target == ignore_index, weight, acc_dtype, reduction
+        target_hat, mask, weight, acc_dtype, reduction
     ).neg_()
 
     loss = _make_zeros((), acc_dtype, device)
@@ -317,6 +318,10 @@ def _batch_chunked_kernel(
 
     if compute_grads:
         torch.sum(term_buf, dim=0, out=loss)
+    if reduction == "mean":
+        # Every row ignored: `row_scale` is all zero, so the sum is 0, whereas
+        # nll_loss's mean is 0 / 0 = nan.
+        loss.masked_fill_(mask.all(), torch.nan)
     if compute_linear_bias_grad:
         grad_linear_bias.copy_(bias_grad_acc)
 

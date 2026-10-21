@@ -84,7 +84,9 @@ def _neg_weight_target(
         )
     if reduction == "mean":
         d = neg_weight_target.sum()
-        neg_weight_target.div_(torch.where(d == 0, torch.nan, -d))
+        # Re-zero the masked rows: when d == 0 the division turns them into
+        # nan, while nll_loss leaves their gradient at zero.
+        neg_weight_target.div_(torch.where(d == 0, torch.nan, -d)).masked_fill_(mask, 0)
     elif reduction == "sum":
         neg_weight_target.neg_()
     else:  # "none"
@@ -1023,6 +1025,11 @@ def _linear_cross_entropy_batch_chunked_accumulator(
             grad_linear_weight,
             grad_linear_bias,
         )
+
+    if reduction == "mean":
+        # Every row ignored: their weights are all zero, so the loop sums to 0,
+        # whereas nll_loss's mean is 0 / 0 = nan.
+        output.masked_fill_(ctx._mask.all(), torch.nan)
 
     # Do not ``break`` from this loop -- ``ctx.chunks()`` runs a
     # post-yield grad_input commit that the in-flight chunk needs.

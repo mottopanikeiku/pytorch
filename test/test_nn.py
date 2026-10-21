@@ -14392,6 +14392,46 @@ class TestNNDeviceType(NNTestCase):
         self.assertEqual(gw_ref, gw)
         self.assertEqual(gb_ref, gb)
 
+    def test_linear_cross_entropy_chunked_mean_zero_total_weight(self, device):
+        """``reduction='mean'`` with a zero total weight (every row ignored,
+        or the remaining rows having zero class weight): the loss is ``nan``
+        (``0 / 0``) on both paths, and the chunked gradients match the
+        reference ``linear`` + ``cross_entropy`` -- zero on ignored rows,
+        ``nan`` only where a row is not ignored.
+        """
+        torch.manual_seed(0)
+        N, F_, C = 6, 4, 5
+        all_ignored = torch.full((N,), -100, device=device)
+        zero_weight = torch.tensor([0, 0, -100, -100, 0, -100], device=device)
+        cw = torch.tensor([0.0, 1.0, 1.0, 1.0, 1.0], device=device)
+        for target, weight in ((all_ignored, None), (all_ignored, cw), (zero_weight, cw)):
+            for bias in (False, True):
+                inp_ref = torch.randn(N, F_, device=device, requires_grad=True)
+                lw_ref = torch.randn(C, F_, device=device, requires_grad=True)
+                lb_ref = (
+                    torch.randn(C, device=device, requires_grad=True) if bias else None
+                )
+                expected = nn.functional.cross_entropy(
+                    nn.functional.linear(inp_ref, lw_ref, lb_ref), target, weight=weight,
+                )
+                params_ref = [inp_ref, lw_ref] + ([lb_ref] if bias else [])
+                grads_ref = torch.autograd.grad(expected, params_ref)
+
+                inp = inp_ref.detach().clone().requires_grad_(True)
+                lw = lw_ref.detach().clone().requires_grad_(True)
+                lb = lb_ref.detach().clone().requires_grad_(True) if bias else None
+                options = nn.LinearCrossEntropyOptions(batch_chunk_size=2)
+                actual = nn.functional.linear_cross_entropy(
+                    inp, lw, target, linear_bias=lb, weight=weight, options=options,
+                )
+                params = [inp, lw] + ([lb] if bias else [])
+                grads = torch.autograd.grad(actual, params)
+
+                self.assertTrue(expected.isnan())
+                self.assertEqual(expected, actual)
+                for ref_g, act_g in zip(grads_ref, grads):
+                    self.assertEqual(ref_g, act_g)
+
     def test_linear_cross_entropy_none_reduction_chunked_matches_reference(self, device):
         """``reduction='none'`` chunked path: the per-sample loss ``(N,)``
         and the backward gradients (under a per-sample downstream
